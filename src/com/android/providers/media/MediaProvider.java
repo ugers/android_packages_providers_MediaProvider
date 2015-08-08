@@ -92,6 +92,9 @@ import libcore.io.Libcore;
 import libcore.io.OsConstants;
 import libcore.io.StructStat;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
@@ -238,16 +241,20 @@ public class MediaProvider extends ContentProvider {
     private Uri mAlbumArtBaseUri = Uri.parse("content://media/external/audio/albumart");
 
     private static final String CANONICAL = "canonical";
+	private boolean mWaitStorageStateChanged = false;
 
     private BroadcastReceiver mUnmountReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (intent.getAction().equals(Intent.ACTION_MEDIA_EJECT)) {
+            if (intent.getAction().equals(Intent.ACTION_MEDIA_EJECT)
+			     || intent.getAction().equals(Intent.ACTION_MEDIA_REMOVED)) {
+			    mWaitStorageStateChanged = true;
                 StorageVolume storage = (StorageVolume)intent.getParcelableExtra(
                         StorageVolume.EXTRA_STORAGE_VOLUME);
                 // If primary external storage is ejected, then remove the external volume
                 // notify all cursors backed by data on that volume.
-                if (storage.getPath().equals(mExternalStoragePaths[0])) {
+                //if (storage.getPath().equals(mExternalStoragePaths[0])) {
+                if(storage.isPrimary()) {
                     detachVolume(Uri.parse("content://media/external"));
                     sFolderArtMap.clear();
                     MiniThumbFile.reset();
@@ -306,6 +313,18 @@ public class MediaProvider extends ContentProvider {
                             }
                         }
                     }
+                }
+            }else if (intent.getAction().equals(Intent.ACTION_MEDIA_UNMOUNTED)) {
+                mWaitStorageStateChanged = false;
+                StorageVolume storage = (StorageVolume)intent.getParcelableExtra(
+                        StorageVolume.EXTRA_STORAGE_VOLUME);
+                Uri externalUri = Uri.parse("content://media/external");
+                if (getDatabaseForUri(externalUri) != null && storage.isPrimary()) {
+                    Log.d(TAG, "Primary storage " + storage.getPath()
+                            + " has been unmounted but db still attach , need detach it again!");
+                    detachVolume(externalUri);
+                    sFolderArtMap.clear();
+                    MiniThumbFile.reset();
                 }
             }
         }
@@ -594,6 +613,8 @@ public class MediaProvider extends ContentProvider {
         attachVolume(INTERNAL_VOLUME);
 
         IntentFilter iFilter = new IntentFilter(Intent.ACTION_MEDIA_EJECT);
+		iFilter.addAction(Intent.ACTION_MEDIA_REMOVED);
+		iFilter.addAction(Intent.ACTION_MEDIA_UNMOUNTED);
         iFilter.addDataScheme("file");
         context.registerReceiver(mUnmountReceiver, iFilter);
 
@@ -2893,7 +2914,14 @@ public class MediaProvider extends ContentProvider {
         // Notify MTP (outside of successful transaction)
         notifyMtp(notifyRowIds);
 
-        getContext().getContentResolver().notifyChange(uri, null);
+        //getContext().getContentResolver().notifyChange(uri, null);
+        ContentResolver contentResolver = getContext().getContentResolver();
+				
+        contentResolver.notifyChange(uri, null);
+        if (match == AUDIO_MEDIA && EXTERNAL_VOLUME.equals(uri.getPathSegments().get(0))) {
+            contentResolver.notifyChange(Audio.Albums.EXTERNAL_CONTENT_URI, null);
+            contentResolver.notifyChange(Audio.Artists.EXTERNAL_CONTENT_URI, null);
+        }
         return numInserted;
     }
 
@@ -2908,7 +2936,14 @@ public class MediaProvider extends ContentProvider {
         // do not signal notification for MTP objects.
         // we will signal instead after file transfer is successful.
         if (newUri != null && match != MTP_OBJECTS) {
-            getContext().getContentResolver().notifyChange(uri, null);
+            //getContext().getContentResolver().notifyChange(uri, null);
+            ContentResolver cr = getContext().getContentResolver();
+			
+            cr.notifyChange(uri, null);
+            if (match == AUDIO_MEDIA && EXTERNAL_VOLUME.equals(uri.getPathSegments().get(0))) {
+                cr.notifyChange(Audio.Albums.EXTERNAL_CONTENT_URI, null);
+                cr.notifyChange(Audio.Artists.EXTERNAL_CONTENT_URI, null);
+            }
         }
         return newUri;
     }
@@ -2969,6 +3004,11 @@ public class MediaProvider extends ContentProvider {
             values.put(FileColumns.DATE_MODIFIED, file.lastModified() / 1000);
         }
         helper.mNumInserts++;
+		if (path!=null && (path.contains("/mnt/extsd") || path.contains("/storage/extsd"))) {
+		    if(!checkExtsdExist(path)){
+                return 0;
+            }
+		}
         long rowId = db.insert("files", FileColumns.DATE_MODIFIED, values);
         sendObjectAdded(rowId);
         return rowId;
@@ -3236,6 +3276,12 @@ public class MediaProvider extends ContentProvider {
                 }
             }
 
+            if (path!=null && (path.contains("/mnt/extsd") || path.contains("/storage/extsd"))) {
+			    if(!checkExtsdExist(path)){
+                    return 0;
+				}
+            }
+		    
             Long parent = values.getAsLong(FileColumns.PARENT);
             if (parent == null) {
                 if (path != null) {
@@ -3268,6 +3314,42 @@ public class MediaProvider extends ContentProvider {
         return rowId;
     }
 
+    private boolean checkExtsdExist(String path) {
+
+        FileInputStream fin = null;
+		BufferedReader bufread = null;
+		String chars = null;
+		boolean result = true;
+
+        try {
+	        fin = new FileInputStream("/proc/driver/sunxi-mmc.0/hostinfo");
+	        bufread =new BufferedReader(new InputStreamReader(fin));
+		
+		    while((chars = bufread.readLine()) != null){
+		       //System.out.println(dr.readLine());
+		       if(chars.contains("Present")) {
+				   if (chars.contains("1")) {
+				      result = true; 
+				   }else if (chars.contains("0")) {
+				       result = false;
+				   }
+				   break;
+			   }
+		    }
+        } catch (IOException e) {
+        	e.printStackTrace();
+        }
+
+		try {
+			    if(fin != null)
+				    fin.close();
+				if(bufread != null)
+				    bufread.close();
+		} catch (IOException e) {
+        	e.printStackTrace();
+        }
+        return result;
+    }
     private Cursor getObjectReferences(DatabaseHelper helper, SQLiteDatabase db, int handle) {
         helper.mNumQueries++;
         Cursor c = db.query("files", sMediaTableColumns, "_id=?",
@@ -3601,7 +3683,27 @@ public class MediaProvider extends ContentProvider {
             case VOLUMES:
             {
                 String name = initialValues.getAsString("name");
-                Uri attachedVolume = attachVolume(name);
+                
+                //Uri attachedVolume = attachVolume(name);
+				Uri attachedVolume = null;
+                long start = System.currentTimeMillis();
+                long wait = 3000;/// wait 3s and then break
+                long sleep = 0;
+                while (mWaitStorageStateChanged && sleep < wait) {
+                    try {
+                        Thread.sleep(1000);
+                        sleep = System.currentTimeMillis() - start;
+                        Log.v(TAG, "to wait storage state change");
+                    } catch (InterruptedException e) {
+                    
+                    }
+                }
+                String state = Environment.getExternalStorageState();
+                if (Environment.MEDIA_MOUNTED.equals(state) ||
+                        Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
+                    mWaitStorageStateChanged = false;
+                    attachedVolume = attachVolume(name);
+                }
                 if (mMediaScannerVolume != null && mMediaScannerVolume.equals(name)) {
                     DatabaseHelper dbhelper = getDatabaseForUri(attachedVolume);
                     if (dbhelper == null) {
@@ -4712,6 +4814,12 @@ public class MediaProvider extends ContentProvider {
         } else if (isWrite) {
             // don't write to non-cache, non-sdcard files.
             throw new FileNotFoundException("Can't access " + file);
+        } else if (isSecondaryExternalPath(path)) {
+            // read access is OK with the appropriate permission
+            if (!readGranted) {
+                c.enforceCallingOrSelfPermission(
+                        READ_EXTERNAL_STORAGE, "External path: " + path);
+            }
         } else {
             checkWorldReadAccess(path);
         }
@@ -5088,7 +5196,9 @@ public class MediaProvider extends ContentProvider {
                     // Note that this only does something if getAlbumArtOutputUri() reused an
                     // existing entry from the database. If a new entry was created, it will
                     // have been rolled back as part of backing out the transaction.
-                    getContext().getContentResolver().delete(out, null, null);
+                    //getContext().getContentResolver().delete(out, null, null);
+                    d.helper.mNumDeletes++;
+                    d.db.delete("album_art", "album_id=" + out.getPathSegments().get(3), null);
                 }
             }
         }
@@ -5352,6 +5462,14 @@ public class MediaProvider extends ContentProvider {
 
                     // generate database name based on volume ID
                     String dbName = "external-" + Integer.toHexString(volumeId) + ".db";
+
+					File invalidDbFile = context.getDatabasePath("external-ffffffff.db");
+                    File rightDbFile = context.getDatabasePath(dbName);
+                    if (volumeId != -1 && !rightDbFile.exists() && invalidDbFile.exists()) {
+                        boolean succuss = invalidDbFile.renameTo(rightDbFile);
+                        Log.d(TAG, "to rename invalid database external-ffffffff.db" );
+                    }
+					
                     helper = new DatabaseHelper(context, dbName, false,
                             false, mObjectRemovedCallback);
                     mVolumeId = volumeId;
